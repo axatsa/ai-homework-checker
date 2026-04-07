@@ -6,8 +6,13 @@ from typing import Any, Awaitable, Callable, Dict, List, Union
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, TelegramObject
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, StateFilter
 from aiogram import BaseMiddleware
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.utils.keyboard import ReplyKeyboardBuilder
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 
 from PIL import Image
 from dotenv import load_dotenv
@@ -26,13 +31,31 @@ if not BOT_TOKEN or not GEMINI_TOKEN:
 logging.basicConfig(level=logging.INFO)
 
 # Инициализируем бота и диспетчер
+storage = MemoryStorage()
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+dp = Dispatcher(storage=storage)
+
+class UserStates(StatesGroup):
+    choosing_subject = State()
+    choosing_english_type = State()
+    active = State()
+
+# Клавиатуры
+def get_subject_kb():
+    builder = ReplyKeyboardBuilder()
+    builder.row(KeyboardButton(text="🇬🇧 Английский"), KeyboardButton(text="🔢 Математика"))
+    return builder.as_markup(resize_keyboard=True)
+
+def get_english_type_kb():
+    builder = ReplyKeyboardBuilder()
+    builder.row(KeyboardButton(text="📝 IELTS"), KeyboardButton(text="🎯 General"))
+    builder.row(KeyboardButton(text="⬅️ Назад"))
+    return builder.as_markup(resize_keyboard=True)
 
 # Настройка Gemini
 genai.configure(api_key=GEMINI_TOKEN)
 
-SYSTEM_PROMPT = """You are an expert tutor in Mathematics and English Language. Your task is to analyze the image or text provided by the student, identify all tasks, and verify the correctness of the solutions.
+SYSTEM_PROMPT_GENERAL = """You are an expert tutor in Mathematics and English Language. Your task is to analyze the image or text provided by the student, identify all tasks, and verify the correctness of the solutions.
 
 For Mathematics: Check every step of the calculation. If there is an error, point out exactly which line is wrong, explain why, and provide the correct step-by-step solution.
 
@@ -61,6 +84,35 @@ Structure your response EXACTLY like this (including emojis):
 [Короткое правило]
 """
 
+SYSTEM_PROMPT_IELTS = """You are an IELTS expert tutor. Your task is to analyze the student's essay or English task and provide feedback in a specific format.
+
+Follow these rules for corrections:
+1. Identify errors in Intro, Body 1, Body 2, and Conclusion sections.
+2. For each correction, show: [original phrase] - [corrected phrase].
+3. Provide an overall score at the end (e.g., 5.5, 6.0, 7.0).
+
+Structure your response EXACTLY like this (using these Russian headers):
+
+Intro:
+- [ошибка] - [исправление]
+
+Body 1:
+- [ошибка] - [исправление]
+
+Body 2:
+- [ошибка] - [исправление]
+
+Conclusion:
+- [ошибка] - [исправление]
+
+<b>Score: [Оценка]</b>
+
+Respond in Russian for explanations, but keep the original/corrected phrases in English.
+Example of correction style:
+moving an another places - moving to other places 
+In this essay I intend - In this essay, I intend
+"""
+
 # Автоматический выбор доступной модели
 AVAILABLE_MODEL = "models/gemini-flash-latest" # Значение по умолчанию
 try:
@@ -81,10 +133,11 @@ try:
 except Exception as e:
     logging.error(f"Failed to fetch model list: {e}")
 
-# Инициализируем модель с системной инструкцией
-model = genai.GenerativeModel(
+# Мы будем использовать динамический выбор модели при генерации, 
+# но для инициализации оставим базовую.
+base_model = genai.GenerativeModel(
     model_name=AVAILABLE_MODEL,
-    system_instruction=SYSTEM_PROMPT,
+    system_instruction=SYSTEM_PROMPT_GENERAL,
 )
 
 class MediaGroupMiddleware(BaseMiddleware):
@@ -136,16 +189,82 @@ async def process_photo_message(message: Message, bot: Bot) -> Image.Image:
     return img
 
 @dp.message(CommandStart())
-async def cmd_start(message: Message):
+async def cmd_start(message: Message, state: FSMContext):
+    await state.set_state(UserStates.choosing_subject)
     await message.answer(
         "👋 Привет! Я твой персональный AI-учитель.\n\n"
-        "Отправь мне фотографию с заданием или просто <b>напиши текст</b> или <b>отправь фотографию</b> с заданием и я сам найду его и проверю.\n\n"
-        "<i>(Можно отправлять текстовые сообщения, несколько фото или документы)</i>",
+        "Пожалуйста, выбери предмет, который мы будем проверять:",
+        reply_markup=get_subject_kb(),
         parse_mode="HTML"
     )
 
-@dp.message(F.photo | F.document | F.text)
-async def handle_homework(message: Message, bot: Bot, album: List[Message] = None):
+@dp.message(UserStates.choosing_subject, F.text == "🇬🇧 Английский")
+async def process_english(message: Message, state: FSMContext):
+    await state.set_state(UserStates.choosing_english_type)
+    await message.answer(
+        "Вы выбрали Английский. Какой тип задания вы хотите проверить?",
+        reply_markup=get_english_type_kb()
+    )
+
+@dp.message(UserStates.choosing_subject, F.text == "🔢 Математика")
+async def process_math(message: Message, state: FSMContext):
+    await state.update_data(subject="math", type="math")
+    await state.set_state(UserStates.active)
+    await message.answer(
+        "Вы выбрали Математику. Теперь отправьте мне фотографию или текст задания, и я его проверю!",
+        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="⬅️ Назад")]], resize_keyboard=True)
+    )
+
+@dp.message(UserStates.choosing_english_type, F.text == "📝 IELTS")
+async def process_ielts(message: Message, state: FSMContext):
+    await state.update_data(subject="english", type="ielts")
+    await state.set_state(UserStates.active)
+    await message.answer(
+        "Вы выбрали IELTS. Отправьте ваше эссе или другое задание уровня IELTS, и я дам развернутый фидбек.",
+        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="⬅️ Назад")]], resize_keyboard=True)
+    )
+
+@dp.message(UserStates.choosing_english_type, F.text == "🎯 General")
+async def process_general(message: Message, state: FSMContext):
+    await state.update_data(subject="english", type="general")
+    await state.set_state(UserStates.active)
+    await message.answer(
+        "Вы выбрали General English. Отправьте задание для проверки.",
+        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="⬅️ Назад")]], resize_keyboard=True)
+    )
+
+@dp.message(F.text == "⬅️ Назад")
+async def process_back(message: Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state == UserStates.choosing_english_type:
+        await cmd_start(message, state)
+    elif current_state == UserStates.active:
+        user_data = await state.get_data()
+        if user_data.get("subject") == "english":
+            await process_english(message, state)
+        else:
+            await cmd_start(message, state)
+
+@dp.message(UserStates.active, F.photo | F.document | F.text)
+async def handle_homework(message: Message, bot: Bot, state: FSMContext, album: List[Message] = None):
+    # Если это текстовое сообщение "Назад", оно обработается выше, 
+    # но на всякий случай проверяем здесь
+    if message.text == "⬅️ Назад":
+        return
+
+    user_data = await state.get_data()
+    mode_type = user_data.get("type", "general")
+    
+    prompt = SYSTEM_PROMPT_GENERAL
+    if mode_type == "ielts":
+        prompt = SYSTEM_PROMPT_IELTS
+        
+    # Создаем модель с нужным промптом
+    current_model = genai.GenerativeModel(
+        model_name=AVAILABLE_MODEL,
+        system_instruction=prompt,
+    )
+
     messages = album if album else [message]
     contents = [] # Список для Gemini (текст + картинки)
     
@@ -167,7 +286,7 @@ async def handle_homework(message: Message, bot: Bot, album: List[Message] = Non
             return
 
         # Генерация ответа (через асинхронный метод старой библиотеки)
-        response = await model.generate_content_async(contents)
+        response = await current_model.generate_content_async(contents)
         
         reply_text = response.text
         if not reply_text:

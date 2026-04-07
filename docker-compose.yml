@@ -1,0 +1,9 @@
+services:
+  bot:
+    build: .
+    container_name: hw_checker_bot
+    restart: always
+    env_file:
+      - .env
+    # Volumes removed for production to keep code inside the image
+    # and not exposed on the host filesystem directly in the project folder.
