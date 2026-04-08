@@ -55,11 +55,9 @@ def get_english_type_kb():
 # Настройка Gemini
 genai.configure(api_key=GEMINI_TOKEN)
 
-SYSTEM_PROMPT_GENERAL = """You are an expert tutor in Mathematics and English Language. Your task is to analyze the image or text provided by the student, identify all tasks, and verify the correctness of the solutions.
+SYSTEM_PROMPT_MATH = """You are an expert tutor in Mathematics. Your task is to analyze the image or text provided by the student, identify all tasks, and verify the correctness of the solutions.
 
-For Mathematics: Check every step of the calculation. If there is an error, point out exactly which line is wrong, explain why, and provide the correct step-by-step solution.
-
-For English: Check grammar, spelling, punctuation, and sentence structure. Explain the grammar rule that was violated.
+Check every step of the calculation. If there is an error, point out exactly which line is wrong, explain why, and provide the correct step-by-step solution.
 
 CRITICAL Formatting rules for your response:
 1. Be concise but clear.
@@ -78,10 +76,37 @@ Structure your response EXACTLY like this (including emojis):
 - [Что не так] — [Почему это ошибка]
 
 ✅ <b>Правильное решение:</b>
-[Текст упражнения или решения, где <b>исправленные</b> места выделены жирным]
+[Текст решения, где <b>исправленные</b> места выделены жирным]
 
 💡 <b>Совет:</b>
 [Короткое правило]
+"""
+
+SYSTEM_PROMPT_ENGLISH_GENERAL = """You are an expert English Language tutor. Your task is to analyze the image or text provided by the student, identify all tasks, and verify the correctness of the solutions.
+
+Check grammar, spelling, punctuation, and sentence structure. Explain the grammar rule that was violated.
+
+CRITICAL Formatting rules for your response:
+1. Be concise but clear.
+2. Use HTML tags for bold text: <b>text</b>. 
+3. In the "✅ Correct solution" section, ALWAYS wrap ONLY the corrected or fixed words/phrases in <b>bold tags</b>.
+4. Use line breaks and dashes (-) for lists to make the "Error analysis" section easy to read.
+5. DO NOT use any Markdown formatting.
+
+Respond ONLY in English. 
+Structure your response EXACTLY like this (including emojis):
+
+📝 <b>Found tasks:</b>
+[Short list]
+
+🔍 <b>Error analysis:</b>
+- [What is wrong] — [Why it is an error]
+
+✅ <b>Correct solution:</b>
+[Text of the exercise, where <b>corrected</b> places are highlighted in bold]
+
+💡 <b>Tip:</b>
+[Short rule]
 """
 
 SYSTEM_PROMPT_IELTS = """You are an IELTS expert tutor. Your task is to analyze the student's essay or English task and provide feedback in a specific format.
@@ -91,23 +116,22 @@ Follow these rules for corrections:
 2. For each correction, show: [original phrase] - [corrected phrase].
 3. Provide an overall score at the end (e.g., 5.5, 6.0, 7.0).
 
-Structure your response EXACTLY like this (using these Russian headers):
+Respond ONLY in English. Structure your response EXACTLY like this:
 
 Intro:
-- [ошибка] - [исправление]
+- [error] - [correction]
 
 Body 1:
-- [ошибка] - [исправление]
+- [error] - [correction]
 
 Body 2:
-- [ошибка] - [исправление]
+- [error] - [correction]
 
 Conclusion:
-- [ошибка] - [исправление]
+- [error] - [correction]
 
-<b>Score: [Оценка]</b>
+<b>Score: [Score]</b>
 
-Respond in Russian for explanations, but keep the original/corrected phrases in English.
 Example of correction style:
 moving an another places - moving to other places 
 In this essay I intend - In this essay, I intend
@@ -137,7 +161,7 @@ except Exception as e:
 # но для инициализации оставим базовую.
 base_model = genai.GenerativeModel(
     model_name=AVAILABLE_MODEL,
-    system_instruction=SYSTEM_PROMPT_GENERAL,
+    system_instruction=SYSTEM_PROMPT_MATH,
 )
 
 class MediaGroupMiddleware(BaseMiddleware):
@@ -254,10 +278,14 @@ async def handle_homework(message: Message, bot: Bot, state: FSMContext, album: 
 
     user_data = await state.get_data()
     mode_type = user_data.get("type", "general")
+    subject = user_data.get("subject", "math")
     
-    prompt = SYSTEM_PROMPT_GENERAL
-    if mode_type == "ielts":
+    if subject == "math":
+        prompt = SYSTEM_PROMPT_MATH
+    elif mode_type == "ielts":
         prompt = SYSTEM_PROMPT_IELTS
+    else:
+        prompt = SYSTEM_PROMPT_ENGLISH_GENERAL
         
     # Создаем модель с нужным промптом
     current_model = genai.GenerativeModel(
