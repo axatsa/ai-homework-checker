@@ -1,3 +1,6 @@
+#Запускать через powershell -ExecutionPolicy Bypass -File .\deploy.ps1
+
+
 # Configuration
 $SERVER_USER = "temp"
 $SERVER_HOST = "thompson.uz"

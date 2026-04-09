@@ -22,10 +22,12 @@ import google.generativeai as genai
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-GEMINI_TOKEN = os.getenv("GEMINI_TOKEN")
+# Поддержка нескольких токенов через запятую
+GEMINI_TOKENS = os.getenv("GEMINI_TOKENS", os.getenv("GEMINI_TOKEN", "")).split(",")
+current_token_index = 0
 
-if not BOT_TOKEN or not GEMINI_TOKEN:
-    raise ValueError("BOT_TOKEN or GEMINI_TOKEN is missing in .env file.")
+if not BOT_TOKEN or not GEMINI_TOKENS[0]:
+    raise ValueError("BOT_TOKEN or GEMINI_TOKENS is missing in .env file.")
 
 # Настроим логирование
 logging.basicConfig(level=logging.INFO)
@@ -48,16 +50,18 @@ def get_subject_kb():
 
 def get_english_type_kb():
     builder = ReplyKeyboardBuilder()
-    builder.row(KeyboardButton(text="📝 IELTS"), KeyboardButton(text="🎯 General"))
+    builder.row(KeyboardButton(text="📝 IELTS"), KeyboardButton(text="🎯 General"), KeyboardButton(text="📊 Тесты"))
     builder.row(KeyboardButton(text="⬅️ Назад"))
     return builder.as_markup(resize_keyboard=True)
 
-# Настройка Gemini
-genai.configure(api_key=GEMINI_TOKEN)
+# Настройка Gemini (начальная)
+genai.configure(api_key=GEMINI_TOKENS[0].strip())
 
 SYSTEM_PROMPT_MATH = """You are an expert tutor in Mathematics. Your task is to analyze the image or text provided by the student, identify all tasks, and verify the correctness of the solutions.
 
 Check every step of the calculation. If there is an error, point out exactly which line is wrong, explain why, and provide the correct step-by-step solution.
+
+If the task is a multiple-choice test (contains options like A, B, C, D), you MUST provide the step-by-step solution first, and then explicitly state the correct letter answer at the end of the "✅ Правильное решение" section.
 
 CRITICAL Formatting rules for your response:
 1. Be concise but clear.
@@ -73,10 +77,10 @@ Structure your response EXACTLY like this (including emojis):
 [Краткий перечень]
 
 🔍 <b>Анализ ошибок:</b>
-- [Что не так] — [Почему это ошибка]
+- [Что не так] — [Почему это ошибка] (если ошибок нет, напиши "Ошибок не обнаружено")
 
 ✅ <b>Правильное решение:</b>
-[Текст решения, где <b>исправленные</b> места выделены жирным]
+[Текст решения, где <b>исправленные</b> места выделены жирным. Если это тест, в конце напиши: <b>Правильный ответ: [Буква]</b>]
 
 💡 <b>Совет:</b>
 [Короткое правило]
@@ -137,30 +141,76 @@ moving an another places - moving to other places
 In this essay I intend - In this essay, I intend
 """
 
-# Автоматический выбор доступной модели
-AVAILABLE_MODEL = "models/gemini-flash-latest" # Значение по умолчанию
-try:
-    available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-    logging.info(f"Available models: {available_models}")
-    
-    # Ищем лучшую из доступных (убираем 2.0-flash, так как на ней limit:0)
-    for preferred in [
-        "models/gemini-2.5-flash",
-        "models/gemini-flash-latest",
-        "models/gemini-3-flash-preview", 
-        "models/gemini-2.5-pro"
-    ]:
-        if preferred in available_models:
-            AVAILABLE_MODEL = preferred
-            break
-    logging.info(f"Selected model: {AVAILABLE_MODEL}")
-except Exception as e:
-    logging.error(f"Failed to fetch model list: {e}")
+SYSTEM_PROMPT_ENGLISH_TESTS = """You are an AI assistant helping a student with an English multiple-choice test.
+Your task is to identify all the questions in the provided image or text and return ONLY the list of correct answers.
+IF its an album of photos, answer for each photo separately.
+
+Format your response as a list where the question number and the correct letter answer ARE BOLD:
+<b>[Number]</b> [Full question text] <b>[Correct Letter]</b>
+
+Example:
+<b>35</b> People say she is very similar to my character. She's very quiet, (35) ____ I'm a lot more sociable. <b>B</b>
+<b>36</b> I ____ a bicycle when I was young. <b>A</b>
+
+CRITICAL:
+1. ONLY return the list.
+2. DO NOT provide explanations.
+3. Every line MUST follow the format: <b>Number</b> Text <b>Letter</b>.
+4. Keep the question text as it appears in the image, including any blanks (____), and put the correct letter answer at the end.
+"""
+
+def get_dynamic_models():
+    """Автоматически находит лучшие доступные модели на аккаунте"""
+    try:
+        models = list(genai.list_models())
+        flash_models = []
+        gemma_models = []
+        
+        for m in models:
+            if 'generateContent' not in m.supported_generation_methods:
+                continue
+            
+            name = m.name
+            low_name = name.lower()
+            
+            if 'flash' in low_name:
+                # Рассчитываем приоритет (чем выше score, тем лучше)
+                score = 0
+                if '3.1' in name: score = 40
+                elif '3' in name: score = 30
+                elif '2.5' in name: score = 20
+                elif '1.5' in name: score = 10
+                
+                # Версии Lite обычно имеют лимиты в 25 раз выше (500 против 20)
+                if 'lite' in low_name: score += 5
+                
+                flash_models.append((name, score))
+            elif 'gemma' in low_name:
+                gemma_models.append(name)
+        
+        # Сортируем: сначала самые новые и Lite
+        flash_models.sort(key=lambda x: x[1], reverse=True)
+        
+        vision_list = [f[0] for f in flash_models]
+        # Если ничего не нашли, возвращаем проверенные fallback-варианты
+        if not vision_list:
+            vision_list = ["models/gemini-1.5-flash", "models/gemini-1.5-flash-latest"]
+            
+        logging.info(f"✨ Dynamic discovery: Found {len(vision_list)} vision models and {len(gemma_models)} text models.")
+        logging.info(f"🏆 Top model: {vision_list[0] if vision_list else 'None'}")
+        
+        return vision_list, gemma_models
+    except Exception as e:
+        logging.error(f"❌ Discovery error: {e}")
+        return ["models/gemini-1.5-flash"], []
+
+# Инициализируем списки при старте
+VISION_MODELS, TEXT_MODELS = get_dynamic_models()
 
 # Мы будем использовать динамический выбор модели при генерации, 
-# но для инициализации оставим базовую.
+# но для инициализации оставим первую найденную.
 base_model = genai.GenerativeModel(
-    model_name=AVAILABLE_MODEL,
+    model_name=VISION_MODELS[0],
     system_instruction=SYSTEM_PROMPT_MATH,
 )
 
@@ -207,7 +257,7 @@ async def process_photo_message(message: Message, bot: Bot) -> Image.Image:
     file_info = await bot.get_file(file_id)
     file_bytes_io = await bot.download_file(file_info.file_path)
     img = Image.open(file_bytes_io)
-    img.thumbnail((3000, 3000), Image.Resampling.LANCZOS)
+    img.thumbnail((1500, 1500), Image.Resampling.LANCZOS)
     if img.mode in ("RGBA", "P"):
         img = img.convert("RGB")
     return img
@@ -257,6 +307,15 @@ async def process_general(message: Message, state: FSMContext):
         reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="⬅️ Назад")]], resize_keyboard=True)
     )
 
+@dp.message(UserStates.choosing_english_type, F.text == "📊 Тесты")
+async def process_english_tests(message: Message, state: FSMContext):
+    await state.update_data(subject="english", type="tests")
+    await state.set_state(UserStates.active)
+    await message.answer(
+        "Вы выбрали режим тестов. Отправьте фото вашего теста по Английскому, и я выдам список ответов.",
+        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="⬅️ Назад")]], resize_keyboard=True)
+    )
+
 @dp.message(F.text == "⬅️ Назад")
 async def process_back(message: Message, state: FSMContext):
     current_state = await state.get_state()
@@ -284,15 +343,11 @@ async def handle_homework(message: Message, bot: Bot, state: FSMContext, album: 
         prompt = SYSTEM_PROMPT_MATH
     elif mode_type == "ielts":
         prompt = SYSTEM_PROMPT_IELTS
+    elif mode_type == "tests":
+        prompt = SYSTEM_PROMPT_ENGLISH_TESTS
     else:
         prompt = SYSTEM_PROMPT_ENGLISH_GENERAL
         
-    # Создаем модель с нужным промптом
-    current_model = genai.GenerativeModel(
-        model_name=AVAILABLE_MODEL,
-        system_instruction=prompt,
-    )
-
     messages = album if album else [message]
     contents = [] # Список для Gemini (текст + картинки)
     
@@ -313,10 +368,59 @@ async def handle_homework(message: Message, bot: Bot, state: FSMContext, album: 
             await status_msg.edit_text("❌ Я не вижу текста или изображения. Пожалуйста, отправьте задание снова.")
             return
 
-        # Генерация ответа (через асинхронный метод старой библиотеки)
-        response = await current_model.generate_content_async(contents)
+        # Определяем, есть ли в контенте изображения
+        has_images = any(not isinstance(c, str) for c in contents)
+
+        # Используем динамически найденные модели
+        MODELS_TO_TRY = list(VISION_MODELS)
         
-        reply_text = response.text
+        # Если фото нет, добавляем в список текстовые модели Gemma
+        if not has_images:
+            MODELS_TO_TRY.extend(TEXT_MODELS)
+        
+        reply_text = None
+        global current_token_index
+        success = False
+        
+        for model_name in MODELS_TO_TRY:
+            if success: break
+            
+            for attempt in range(len(GEMINI_TOKENS)):
+                try:
+                    # Берем текущий токен
+                    token = GEMINI_TOKENS[current_token_index % len(GEMINI_TOKENS)].strip()
+                    genai.configure(api_key=token)
+                    
+                    logging.info(f"🚀 Trying model {model_name} with token index {current_token_index % len(GEMINI_TOKENS)}")
+                    
+                    current_model = genai.GenerativeModel(
+                        model_name=model_name,
+                        system_instruction=prompt,
+                    )
+                    
+                    response = await current_model.generate_content_async(contents)
+                    reply_text = response.text
+                    success = True
+                    logging.info(f"✅ Success with model {model_name}")
+                    break 
+                except Exception as e:
+                    err_str = str(e).lower()
+                    if "429" in err_str or "quota" in err_str:
+                        logging.warning(f"⚠️ Limit hit (429) for model {model_name} and token {current_token_index % len(GEMINI_TOKENS)}. Rotating token...")
+                        current_token_index += 1
+                        continue
+                    elif "404" in err_str or "not found" in err_str or "403" in err_str:
+                        logging.warning(f"❌ Model {model_name} not available or access denied. Skipping to next model...")
+                        break # Выходим из цикла токенов для этой модели и пробуем следующую
+                    else:
+                        logging.error(f"❌ Unexpected error with model {model_name}: {e}")
+                        # Пробуем следующий токен для этой же модели
+                        current_token_index += 1
+                        continue
+            
+            if not success:
+                logging.warning(f"⏭ All tokens exhausted or failed for model {model_name}. Trying next model...")
+
         if not reply_text:
             await status_msg.edit_text("🤔 Я не смог распознать текст или задания на этом фото.")
             return
@@ -350,7 +454,7 @@ async def handle_homework(message: Message, bot: Bot, state: FSMContext, album: 
         logging.error(f"Error: {e}")
         error_msg = str(e).lower()
         if "429" in error_msg or "quota" in error_msg:
-             await status_msg.edit_text("⏳ Лимиты API на сегодня исчерпаны. Попробуйте создать новый ключ или подождите немного.")
+             await status_msg.edit_text("⏳ Лимиты API на сегодня исчерпаны. Попробуйте нажать кнопку Назад и проверить еще раз, либо подождите немного.")
         elif "404" in error_msg:
              await status_msg.edit_text("⚠️ Ошибка: модель не найдена. Проверьте API ключ или новый проект.")
         else:
